@@ -1,0 +1,275 @@
+## 浅析 ZGC 
+
+> 『 总之岁月漫长，然而值得等待 』
+
+JVM垃圾收集器的发展过程从某种角度来说可以看作人类在不断追求STW尽量短暂的过程，而这个过程中涌现了很多优秀的垃圾收集器。从开始的单线程 Serial GC到 CMS 再到 G1，直到 ZGC的出现让GC提升到了一个新的高度。虽然官方已经在JDK11中加入了ZGC并且成为了标配，但是其神秘的面纱一直未被揭开，以至于很多人还对他有些陌生。
+
+如果说CMS的出现大大缩短了STW的时间，实现了第一款伪并发GC收集器，那么G1就是一次更大的跨越，G1中提出的Fegin概念让垃圾回收变得可期待，人们能够按照自己的意愿去尽量缩短STW的时间，虽然这种短时间是以吞吐量为代价，但是在计算机硬件性能十分过剩的今天，这种代价明显是可接受的。
+
+虽然 G1很美好，并且也是目前使用非常多的GC收集器，但是还是有不少的缺点。
+
+- 由于G1使用三色算法，不可避免地会产生浮动垃圾
+- G1同样无法避免Full GC，那么当堆十分巨大地时候(上百GB)，STW的停顿时间同样是不可忽略的
+- 由于使用了Remember Set记录跨代引用信息，会产生1% ~ 20%的额外内存消耗
+
+如果说 G1 是现在流行的收集器，那么 GC 就可以说是来自未来的怪兽。为什么这么形容 ? 先来看一张 SPECjbb给出的测评结果。
+
+![](https://s1.ax1x.com/2020/06/07/t20EAP.png)
+
+一目了然，ZGC的强大之处在于，无论堆有多大，其GC停顿时间都没有超过10ms。
+
+一图胜千言，同样，该机构也做了很多的测评结果，都发布在`  The Z Garbage Collector - An Introduction`这一文档中。
+
+> 文档地址 : http://cr.openjdk.java.net/~pliden/slides/ZGC-FOSDEM-2018.pdf
+
+如果足够细心，结合谷歌上的一些资料以及该文档，那么ZGC的学习曲线会变得更加平滑，这一点是来自我的体会，因为ZGC的学习思路和难度相较于之前的GC收集器，都有一个比较大的增长，而更让我们不易理解的是，ZGC很多内容和操作系统相关，如果基础不够扎实，很容易导致概念架空而不得解的情况。
+
+## ZGC
+
+> **The Z Garbage Collector**, also known as **ZGC**, is a scalable low latency garbage collector designed to meet the following goals:
+>
+> - Max pause times of **a few milliseconds** **(\*)**
+> - Pause times **do not** increase with the heap or live-set size **(\*)**
+> - Handle heaps ranging from a **8MB** to **16TB** in size
+
+这段描述是最为能够精准概括ZGC优点和目标的一段话。就好像魔术一样，ZGC的性能让很多垃圾收集器汗颜。
+
+按照正常的逻辑，随着堆越来越大，回收起来停顿时间就会越来越长，这是符合我们正常逻辑思维的。但是在ZGC中，却能够实现STW的时间不随堆大小的变更，与此同时又能维护一个1 ~ 10ms的Pause时间，这让整个回收过程变得十分"顺滑"。
+
+同时，ZGC的堆存储量也是一个惊喜，在JDK11中能够配置4TB的堆内存大小，而在JDK14中，这个容量进一步扩大，到达16TB容量。而为什么是16TB ？这一点在后面会简单总结。
+
+**注意 : ZGC目前仅支持64位平台**
+
+| Platform      | Supported                                                    | Since  | Comment                                                      |
+| :------------ | :----------------------------------------------------------- | :----- | :----------------------------------------------------------- |
+| Windows       | ![(tick)](https://wiki.openjdk.java.net/s/en_US/7901/0059a6c4a9a3d763ef46aeebecc5e24fefd039f0/_/images/icons/emoticons/check.svg) | JDK 14 | Requires Windows version 1803 (Windows 10 or Windows Server 2019) or later. |
+| Linux/x64     | ![(tick)](https://wiki.openjdk.java.net/s/en_US/7901/0059a6c4a9a3d763ef46aeebecc5e24fefd039f0/_/images/icons/emoticons/check.svg) | JDK 11 |                                                              |
+| Linux/AArch64 | ![(tick)](https://wiki.openjdk.java.net/s/en_US/7901/0059a6c4a9a3d763ef46aeebecc5e24fefd039f0/_/images/icons/emoticons/check.svg) | JDK 13 |                                                              |
+| macOS         | ![(tick)](https://wiki.openjdk.java.net/s/en_US/7901/0059a6c4a9a3d763ef46aeebecc5e24fefd039f0/_/images/icons/emoticons/check.svg) | JDK 14 |                                                              |
+
+简单了解了ZGC的目标，下面就是关于如何实现这个目标。ZGC的出现经历了多个阶段，并且吸取了多篇论文的优秀理论，所以ZGC中的概念也是相对于G1和CMS要多一些，如果能够真正理解好这些概念，就能从内部理解ZGC的原理。
+
+我们来看下官方文档中给出的一些理论依据 : 
+
+> **At a Glance**
+>
+> - New garbage collector 一种全新的垃圾回收器
+> - Load barriers 读屏障
+> - Colored pointers 染色指针
+> - Single generation  **暂时**不分代
+> - Partial compaction 内存区域压缩
+> - Region-based 基于Region
+> - Immediate memory reuse 垃圾回收内存会被立即使用
+> - NUMA-aware NUMA模型
+
+这些概念如果每个都去深究，必然会浪费大量时间，因为每一个概念背后都有非常多论文和实验的支撑，也是很多大牛在多次讨论实践后得出的普适性结果，所以，我们对于这些概念学习，不必去深究为什么要这样做，而是需要关注概念本身，那么在之后的文中，尽量从简单的内容入手，最终重点会落在读屏障和染色指针方面。
+
+## NUMA-aware
+
+一般来说，服务器中不止一个CPU，而多个CPU在内存中分配数据的过程有多种方式，流行的并行体系结构计算机分为以下两种模型：
+
+1. 统一内存访问（UMA）
+2. 非统一内存访问（NUMA）
+
+ZGC依赖NUMA-aware(非均衡存储器访问)，需要我们的内存支持这种特点
+
+### UMA 统一内存访问
+
+UMA又称为`Uniform Memory Access`，所谓对称多处理器结构，是指服务器中多个CPU对称工作，无主次或从属关系。各CPU共享相同的物理内存，每个 CPU访问内存中的任何地址所需时间是相同的。对于UMA服务器拓展方式主要是增添硬件基础，例如增加CPU，增加更多的内存，磁盘等硬件。
+
+但是正是因为共享的原因，导致导致了UMA服务器的主要问题，那就是它的扩展能力非常有限。对于SMP服务器而言，每一个共享的环节都可能造成SMP服务器扩展时的瓶颈，而最受限制的则是内存。由于每个CPU必须通过相同的内存总线访问相同的内存资源，因此随着CPU数量的增加，内存访问冲突将迅速增加，最终会造成CPU资源的浪费，使CPU性能的有效性大大降低。实验证明，UMA服务器CPU利用率最好的情况是2至4个CPU。
+
+例如一种常见的情况，当多个CPU都申请同一块内存地址，那么就会进行加锁处理，此时就导致CPU阻塞，性能下降。
+
+![](https://s1.ax1x.com/2020/06/07/t25Z4g.png)
+
+图中，物理存储器被所有处理机均匀共享。所有处理机对所有存储字具有相同的存取时间，这就是为什么称它为均匀存储器存取的原因。每台处理机可以有私用高速缓存,外围设备也以一定形式共享。
+
+### NUMA 非统一内存访问
+
+NUMA(Non-Uniform Memory Access)非同一内存访问是一种新的拓展思路。随着服务器性能需求的越来越大，UMA的限制也逐渐体现出来，人们开始探究如何进行有效地扩展从而构建大型系统的技术，NUMA就是这种努力下的结果之一利用NUMA技术，可以把几十个CPU(甚至上百个CPU)组合在一个服务器内。
+
+![](https://s1.ax1x.com/2020/06/07/t2otXR.png)
+
+NUMA模型如图。每台机器都会配备几个CPU的集合，由多台机器组成一个大型的内存空间，这些内存空间分为两种。
+
+- 本地内存 : 物理机种直接连接的储存空间
+- 远程内存 : 通过总线连接到其他物理机中的内存
+
+这两者最大的区别就是本地内存空间读取速度远远高于远程空间，原因显而易见。
+
+由于其节点之间可以通过互联模块(如称为Crossbar Switch)进行连接和信息交互，因此每个CPU可以访问整个系统的内存。显然，访问本地内存的速度将远远高于访问远地内存(系统内其它节点的内存)的速度，这也是非一致存储访问NUMA的由来。
+
+但NUMA技术同样有一定缺陷，由于访问远地内存的延时远远超过本地内存，因此当CPU数量增加时，系统性能无法线性增加。如HP公司发布Superdome服务器时，曾公布了它与HP其它UNIX服务器的相对性能值，结果发现，64路CPU的Superdome (NUMA结构)的相对性能值是20，而8路N4000(共享的SMP结构)的相对性能值是6.3. 从这个结果可以看到，8倍数量的CPU换来的只是3倍性能的提升。
+
+## ZGC Region
+
+### Region分区
+
+和G1相同，ZGC也将堆划分为Region作为清理，移动，以及并行GC线程工作分配的单位。
+
+但是不同的是，在G1的堆分配中，每个Region大小相同，只不过分为四种等级，但是在ZGC中，Region划分为为三种Group，分别为Small Page，Medium Page，Large Page。
+
+- 小型Region（Small Region）：容量固定为2MB，用于放置小于256KB的小对象。
+- 中型Region（Medium Region）：容量固定为32MB，用于放置大于等于256KB但小于4MB的对象。
+- 大型Region（Large Region）：容量不固定，可以动态变化，但必须为2MB的整数倍，用于放置4MB或以上的大对象。每个大型Region中只会存放一个大对象，所以实际容量可能小于中型Region，最小容量可低至4MB。大型Region在ZGC的实现中是不会被重分配的，因为复制一个大对象的代价非常高昂。
+
+### 回收过程
+
+在CMS中会使用到Mark-Swap算法，因此CMS的一个缺点就是会出现大量的内存碎片导致Full GC。而ZGC和G1相同，都是通过Mark-Compact算法，会将活着的对象都移动到另一个Region，整个回收掉原来的Region。
+
+这个过程就是之前在文章头部提到的**Partial compaction**，下面用一组图来描述下这个垃圾回收的过程。
+
+**1. Pause Mark Start －初始停顿标记**
+
+此阶段需要STW，获取GC Roots直接引用到的对象作为第一批存活对象。
+
+![](https://s1.ax1x.com/2020/06/07/tRCci4.png)
+
+**2. Concurrent Mark －并发标记**
+
+并发标记，和三色算法类似。
+
+![](https://s1.ax1x.com/2020/06/07/tRCodO.png)
+
+**3. Relocate － 移动对象**
+
+对比发现3、6、7是过期对象，也就是中间的两个灰色region需要被压缩清理，所以陆续将4、5、8  对象移动到最右边的新Region。移动过程中，有个forward table纪录这种转向。
+
+![](https://s1.ax1x.com/2020/06/07/tRCqWd.png)
+
+这里有一个需要注意的点，在ZGC的文档中提到过一个概念**Immediate memory reuse**，当活着的对象被移动走时，这个region可以马上被使用，当再有新的对象分配时，会直接分配到该Region上。
+
+> **Immediate memory reuse**的概念最简单的理解就是 : 当扫描整个堆时，只需要一个空的Region即可。
+
+如果能够理解这句话，就能够理解**Immediate memory reuse**的意义。
+
+正常情况下，我们必须保证堆内有足够大的一个区域能存放下能够存活的对象，然后将所有的对象存放到这个区域，就像Survivor。但是在ZGC中，这个区域并不需要能够放下所有的对象，只需要能够存放下一个Region的对象，这样就能够先释放一个Region，然后这个Region立即能够被使用，即使此时处于垃圾收集的过程中，此时我们获得了两个Region，又能够回收两个Region的垃圾，以此类推，就能够将所有的垃圾收集完成。
+
+**4. Remap － 修正指针**
+
+最后将指针都妥帖地更新指向新地址。
+
+![](https://s1.ax1x.com/2020/06/07/tRPc0f.png)
+
+
+
+### 内存优势
+
+由于使用了Region，所以可能会出现跨代引用的问题。而G1中解决跨代引用问题的方法是维护一个**Remember Set**来记录该Region中的跨代引用的情况。通过这种方式避免每次扫描Region，但是付出的代价是需要额外的内存消耗，在对象频繁变更的情况下，由于需要维护Remember Set和Write Barrier可能会带来20%左右的内存消耗。
+
+而ZGC几乎没有停顿，所以划分Region并不是为了增量回收，每次都会对所有Region进行回收，所以也就不需要这个占内存的RememberSet了，又因为它暂时连分代都还没实现，所以完全没有Write Barrier。
+
+那么问题又来了，ZGC如何维护引用的关系呢 ? 毕竟这才是垃圾收集时真正被关注的内容。
+
+##  Colored Pointers
+
+染色指针(colored pointers)并不是一个全新的概念，很早之前就有过相关的论文，但是相关的资料并不多。在Google上能够找到一篇文章对Colored Pointers有一些介绍。
+
+> https://hub.packtpub.com/getting-started-with-z-garbage-collectorzgc-in-java-11-tutorial/
+
+### 什么是染色指针 ? 
+
+官方文档中给出的介绍如下 : 
+
+> **Colored Pointers**
+>
+> Colored pointers are one of the core concepts of ZGC. It enables ZGC to **find**, **mark**, **locate**, and **remap** the objects. 
+>
+> - Core design concept in ZGC
+> - Metadata stored in unused bits in 64-bit pointers
+> - Virtual Address-masking either in hardware, OS or software
+
+这几句话基本上就完全概括了**Colored Pointers**的核心本质。这里引入一个经典问题。
+
+> **为什么会把GC信息放在指针上呢？**
+
+- 追踪式收集算法的标记阶段就是看有没有引用，所以可以只和指针打交道而不管指针所引用的对象本身。
+- 例如对象标记过程就是打个三色标记，这些标记本质上只和对象引用有关，和对象本身无关。某个对象只有它的引用关系才能决定它的存活。
+
+### 引用结构
+
+回忆一下，在之前的收集器中，对象的GC信息全部记录在对象头中，例如分代年龄，例如GC标记。当我们收集的时候，需要直接操作对象本身，因为只有对象本身才会具有这些状态信息，但是这样带来什么问题呢？
+
+一个对象可以被多个引用连接，但是一个引用只能够映射一个对象。那么当多个引用都指向一个对象的时候，在GC的时候就需要全面的去排查这些引用，查看是否被GC Roots连接，这也是一直以来难以解决的问题。即使G1中，也依旧需要维护一个Remember Set来记录这种引用的关系。
+
+而在ZGC中，这种GC信息维护的关系，被移交到了引用之上(指针)。
+
+![](https://s1.ax1x.com/2020/06/07/tRmVXQ.png)
+
+这是一张非常经典的图，在官方文档和很多相关文章中都能看到它的身影。
+
+我们在Java中创建一个对象`  Object obj = new Object()`，在ZGC的情况下，`obj`这个指针会分配64bit的内存空间。而这64bit的内存空间会被分为如图中的几块。
+
+- Finalizable：表示是否只能通过finalize()方法才能被访问到，其他途径不行；
+- Remapped：表示是否进入了重分配集（即被移动过）；
+- Marked1、Marked0：表示对象的三色标记状态；
+
+ZGC使用了内存多重映射（Multi-Mapping）将多个不同的虚拟内存地址映射到同一个物理内存地址上，这是一种多对一映射。因为染色指针只是重新定义内存中某些指针的其中几位，OS又不支持，OS只会把整个指针当做一个内存地址来对待，只是它自己瞎想，为了解决这个问题，使用了现代处理器的**虚拟内存映射技术**
+
+![](https://imgkr.cn-bj.ufileos.com/b0417665-12be-4e91-a524-ded685cdc986.png)
+
+> ZGC的多重映射只是它采用染色指针技术的伴生产物
+
+### 染色指针优势
+
+1. 一旦某个Region的存活对象被移走之后，这个Region立即就能够被释放和重用掉，而不必等待整个堆中所有指向该Region的引用都被修正后才能清理，这使得理论上只要还有一个空闲Region，ZGC就能完成收集。而Shenandoah需要等到更新阶段结束才能释放回收集中的Region，如果Region里面对象都存活的时候，需要1:1的空间才能完成收集。
+2. 染色指针可以大幅减少在垃圾收集过程中内存屏障的使用数量，ZGC只使用了读屏障。
+3. 染色指针具备强大的扩展性，它可以作为一种可扩展的存储结构用来记录更多与对象标记、重定位过程相关的数据，以便日后进一步提高性能。
+
+### 读屏障
+
+读屏障的设计同样是ZGC低STW时间的关键之一。以往垃圾收集器中，一旦触发STW后，需要粗暴的打断所有的对象访问，即使该对象在本次GC中并不会进行移动。而在G1中为了尽量减少这种情况，使用了Write Barrier配合Remember Set记录对象状态变更来减少对象无意义的更新。
+
+而ZGC中则更进一步，使用了**Load Barrier**读屏障技术，让对象的访问变得更加灵活。
+
+在程序中，我们通过引用来操作对象，当对对象进行操作的时候，首先会检查引用中的4bit的标志位。如果标志位为0，则说明对象未变化，直接操作即可，如果标志位不为0，说明对象正在移动，此时如果访问该对象是不安全的，此时会等待对象移动完毕后再进行操作，这个时间并不会很长，并且只有在对象移动的时候才会发生。
+
+> **通过这种方式，当访问引用的对象在移动时，并不需要等待整个GC完成，只需要等待对应对象的移动完成即可。**
+
+这也是ZGC中提及的" GC停顿时间不会随堆大小而变化 "，因为对象的移动只会导致指向它的引用停顿一下，而不会造成整个程序进行等待。
+
+形象一点来说，读屏障就像是对于对象访问的AOP和CAS操作，即访问前检查，对象移动时自旋，而这一自选过程也成为"自愈"。
+
+### ZGC流程
+
+- **并发标记（Concurrent Mark）**：与G1、Shenandoah一样，并发标记是遍历对象图做可达性分析的阶段，它的初始标记和最终标记也会出现短暂的停顿，整个标记阶段只会更新染色指针中的Marked 0、Marked 1标志位。
+- **并发预备重分配（Concurrent Prepare for Relocate）**：这个阶段需要根据特定的查询条件统计得出本次收集过程要清理哪些Region，将这些Region组成**重分配集（Relocation Set）**。ZGC每次回收都会扫描所有的Region，用范围更大的扫描成本换取省去G1中记忆集的维护成本。
+- **并发重分配（Concurrent Relocate）**：重分配是ZGC执行过程中的核心阶段，这个过程要把重分配集中的存活对象复制到新的Region上，并为重分配集中的每个Region维护一个转发表（Forward Table），记录从旧对象到新对象的转向关系。ZGC收集器能仅从引用上就明确得知一个对象是否处于重分配集之中，如果用户线程此时并发访问了位于重分配集中的对象，这次访问将会被预置的内存屏障所截获，然后立即根据Region上的转发表记录将访问转发到新复制的对象上，并同时修正更新该引用的值，使其直接指向新对象，ZGC将这种行为称为指针的“自愈”（Self-Healing）能力。
+- **并发重映射（Concurrent Remap）**：重映射所做的就是修正整个堆中指向重分配集中旧对象的所有引用，但是ZGC中对象引用存在“自愈”功能，所以这个重映射操作并不是很迫切。ZGC很巧妙地把并发重映射阶段要做的工作，合并到了下一次垃圾收集循环中的并发标记阶段里去完成，反正它们都是要遍历所有对象的，这样合并就节省了一次遍历对象图的开销。
+
+## ZGC总结
+
+ZGC重点实际上就是Region的分配，染色指针以及其读屏障，这三者正是整个ZGC的核心。将标记追踪的垃圾回收算法重点从对象转为引用(因为对象本身属性并不会对GC产生任何影响)，将GC信息加入64bit的指针中，从而能够让STW从所有暂停变为单个引用访问的停顿。
+
+### ZGC优点
+
+- 低停顿，高吞吐量，ZGC收集过程中额外耗费的内存小。
+  - `低停顿`，几乎所有过程都是并发的，只有短暂的STW。
+  - `内存小`，ZGC没有写屏障，卡表之类的。
+  - `吞吐量方面`，在ZGC的`‘弱项’`吞吐量方面，因为和用户线程并发，还是有影响的。**`但是！但是！，以低延迟为首要目标的ZGC已经达到了以高吞吐量为目标Parallel Scavenge的99%,直接超越了G1。`**
+- G1通过写屏障维护记忆集，才能处理跨代指针，得以实现增量回收。记忆集占用大量内存，写屏障对正常程序造成额外负担。
+- 在多核处理器的某种架构下，ZGC优先在线程当前所处的处理器的本地内存上分配对象，以保证内存高效访问。
+- **并发停顿方面**：ZGC只有短暂的STW，大部分的过程都是和应用线程并发执行，比如最耗时的并发标记和并发移动过程。
+- **ZGC中没有引入分代，也就没有新生代和老年代的概念**，只有一块一块的内存区域page，以page单位进行对象的分配和回收。
+- 并发的标记-整理算法。没有内存碎片。
+
+### ZGC不足
+
+承受的对象分配速率不会太高，因为浮动垃圾。
+
+- ZGC的停顿时间是在10ms以下，但是ZGC的执行时间还是远远大于这个时间的。假如ZGC全过程需要执行10分钟，在这个期间由于对象分配速率很高，将创建大量的新对象，这些对象很难进入当次GC，所以只能在下次GC的时候进行回收，这些只能等到下次GC才能回收的对象就是浮动垃圾。
+- 造成回收到的内存空间小于期间并发产生的浮动垃圾所占的空间。
+
+> ZGC没有分代概念，每次都需要进行全堆扫描，导致一些“朝生夕死”的对象没能及时的被回收。所以就不存在Young GC、Old GC，所有的GC行为都是Full GC。
+
+## 参考资料
+
+- 《深入理解Java虚拟机 第三版》
+- [The Z Garbage Collector - An Introduction](http://cr.openjdk.java.net/~pliden/slides/ZGC-FOSDEM-2018.pdf)
+- [OpenJDKWiki - Z Garbage Collector](https://wiki.openjdk.java.net/display/zgc/Main)
+- [UMA & NUMA模型](https://www.cnblogs.com/linhaostudy/p/9980383.html)
+- [Java程序员的荣光，听R大论JDK11的ZGC](https://juejin.im/entry/5b86a276f265da435c4402d4)
+- [Getting started with Z Garbage Collector (ZGC) in Java 11 [Tutorial]](https://hub.packtpub.com/getting-started-with-z-garbage-collectorzgc-in-java-11-tutorial/)
+- [[理解JVM垃圾收集器-ZGC](https://segmentfault.com/a/1190000021711902)](https://segmentfault.com/a/1190000021711902)
+- [一文带你深入理解JVM - ZGC垃圾收集器](https://juejin.im/post/5e3c0a7bf265da5724465f45)
